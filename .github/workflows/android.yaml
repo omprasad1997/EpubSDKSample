@@ -2,7 +2,7 @@ name: Android CI
 
 on:
   push:
-    branches: [ week_1 ]
+    branches: [ week_1, week_2 ]
 
 jobs:
 
