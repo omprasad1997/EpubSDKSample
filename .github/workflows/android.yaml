@@ -28,7 +28,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Run unit tests
-        run: ./gradlew test --stacktrace
+        run: ./gradlew test --stacktrace --warning-mode all
 
       - name: Upload test results
         if: always()
@@ -69,7 +69,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: ./gradlew assembleDebug --stacktrace --warning-mode all
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -101,7 +101,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build SDK release AAR
-        run: ./gradlew :epub-sdk:assembleRelease --stacktrace
+        run: ./gradlew :epub-sdk:assembleRelease --stacktrace --warning-mode all
 
       - name: Upload AAR
         uses: actions/upload-artifact@v4
@@ -132,7 +132,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Run lint
-        run: ./gradlew lint --stacktrace
+        run: ./gradlew lint --stacktrace --warning-mode all
 
       - name: Upload lint results
         if: always()
