@@ -62,5 +62,6 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.mockk)
+    testImplementation(libs.xpp3)
     testImplementation(libs.kotlinx.coroutines.test)
 }
