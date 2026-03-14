@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.MenuBook
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -24,6 +25,7 @@ import com.example.omireadersdk.viewmodel.MainViewModel
 import com.example.omireadersdk.sdk.model.EpubBook
 import com.example.omireadersdk.sdk.model.EpubVersion
 import com.example.omireadersdk.sdk.model.TocEntry
+import com.example.omireadersdk.ui.reader.ReaderScreen
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
@@ -42,11 +44,18 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
     val uiState by viewModel.uiState.collectAsState()
+    var readerUri by rememberSaveable { mutableStateOf<android.net.Uri?>(null) }
 
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let { viewModel.loadEpub(it) }
+    }
+
+    // Navigate to reader
+    readerUri?.let { uri ->
+        ReaderScreen(epubUri = uri)
+        return@MainScreen
     }
 
     Scaffold(
@@ -74,7 +83,10 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
             when (val state = uiState) {
                 is MainUiState.Idle    -> EmptyState()
                 is MainUiState.Loading -> LoadingState()
-                is MainUiState.Loaded  -> BookInfoScreen(book = state.book)
+                is MainUiState.Loaded  -> BookInfoScreen(
+                    book = state.book,
+                    onReadClick = { readerUri = viewModel.currentUri }
+                )
                 is MainUiState.Error   -> ErrorState(message = state.message)
             }
         }
@@ -133,7 +145,10 @@ private fun ErrorState(message: String) {
 }
 
 @Composable
-private fun BookInfoScreen(book: EpubBook) {
+private fun BookInfoScreen(
+    book: EpubBook,
+    onReadClick: () -> Unit
+    ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
@@ -170,6 +185,13 @@ private fun BookInfoScreen(book: EpubBook) {
                     val overlayCount = book.manifest.values.count { it.isSmil }
                     if (overlayCount > 0) {
                         AssistChip(onClick = {}, label = { Text("$overlayCount media overlays") })
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = onReadClick,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Read Book")
                     }
                 }
             }

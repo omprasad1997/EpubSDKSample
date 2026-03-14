@@ -13,17 +13,22 @@ import javax.inject.Singleton
 
 @Singleton
 class WebViewRenderer @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val resourceServer: EpubResourceServer
 ) {
     private var webView: WebView? = null
+    private var onPageReady: (() -> Unit)? = null
 
     @SuppressLint("SetJavaScriptEnabled")
-    fun attach(container: ViewGroup) {
+    fun attach(container: ViewGroup, onPageReady: (() -> Unit)? = null) {
         release()
+        this.onPageReady = onPageReady
         val wv = WebView(context).apply {
             settings.javaScriptEnabled = true
             settings.allowFileAccess = false
             settings.allowContentAccess = false
+            settings.loadWithOverviewMode = true
+            settings.useWideViewPort = true
             webViewClient = EpubWebViewClient()
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -34,22 +39,42 @@ class WebViewRenderer @Inject constructor(
         webView = wv
     }
 
-    fun loadContent(href: String) {
-        // TODO (Week 2): resolve href to ZIP entry and serve via shouldInterceptRequest
-        webView?.loadUrl("about:blank")
+    /**
+     * Loads an XHTML spine item from the EPUB ZIP.
+     * Uses loadDataWithBaseURL so relative CSS/image paths resolve correctly.
+     */
+    fun loadContent(spineHref: String) {
+        val wv = webView ?: return
+        val (html, baseUrl) = resourceServer.loadSpineItem(spineHref) ?: run {
+            wv.loadUrl("about:blank")
+            return
+        }
+        wv.loadDataWithBaseURL(
+            baseUrl,
+            html,
+            "text/html",
+            "UTF-8",
+            null
+        )
     }
 
-    fun highlight(fragmentId: String) {
+    /**
+     * Adds the active highlight class to the element with [fragmentId].
+     * Uses the EPUB standard class: -epub-media-overlay-active
+     */
+    fun highlight(fragmentId: String, activeClass: String = "-epub-media-overlay-active") {
         if (fragmentId.isBlank()) return
+        val safeId = fragmentId.replace("'", "\\'")
+        val safeClass = activeClass.replace("-", "\\-")
         webView?.evaluateJavascript(
             """
             (function() {
-                document.querySelectorAll('.colibrio-hl').forEach(function(el) {
-                    el.classList.remove('colibrio-hl');
+                document.querySelectorAll('.$safeClass').forEach(function(el) {
+                    el.classList.remove('$activeClass');
                 });
-                var el = document.getElementById('${fragmentId.replace("'", "\\'")}');
+                var el = document.getElementById('$safeId');
                 if (el) {
-                    el.classList.add('colibrio-hl');
+                    el.classList.add('$activeClass');
                     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 }
             })();
@@ -58,29 +83,9 @@ class WebViewRenderer @Inject constructor(
         )
     }
 
-    fun clearHighlight() {
+    fun clearHighlight(activeClass: String = "-epub-media-overlay-active") {
         webView?.evaluateJavascript(
-            "document.querySelectorAll('.colibrio-hl').forEach(function(el) { el.classList.remove('colibrio-hl'); });",
-            null
-        )
-    }
-
-    fun injectHighlightStyle(color: String = "#FFD700", opacity: Float = 0.4f) {
-        val alphaHex = (opacity * 255).toInt().coerceIn(0, 255)
-            .toString(16).padStart(2, '0')
-        val css = ".colibrio-hl{background-color:${color}${alphaHex};border-radius:2px;transition:background-color 0.2s ease;}"
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                var existing = document.getElementById('colibrio-style');
-                if (!existing) {
-                    existing = document.createElement('style');
-                    existing.id = 'colibrio-style';
-                    document.head.appendChild(existing);
-                }
-                existing.textContent = '$css';
-            })();
-            """.trimIndent(),
+            "document.querySelectorAll('.$activeClass').forEach(function(el){el.classList.remove('$activeClass');});",
             null
         )
     }
@@ -88,20 +93,22 @@ class WebViewRenderer @Inject constructor(
     fun release() {
         webView?.destroy()
         webView = null
+        onPageReady = null
     }
 
     private inner class EpubWebViewClient : WebViewClient() {
+
         override fun shouldInterceptRequest(
             view: WebView,
             request: WebResourceRequest
         ): WebResourceResponse? {
-            // TODO (Week 2): serve resources from ZIP
-            return super.shouldInterceptRequest(view, request)
+            return resourceServer.shouldInterceptRequest(request)
+                ?: super.shouldInterceptRequest(view, request)
         }
 
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
-            injectHighlightStyle()
+            onPageReady?.invoke()
         }
     }
 }

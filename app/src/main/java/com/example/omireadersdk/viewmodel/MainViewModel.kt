@@ -22,11 +22,13 @@ class MainViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val epubParser: EpubParser
 ) : ViewModel() {
-
+    var currentUri: Uri? = null
+        private set
     private val _uiState = MutableStateFlow<MainUiState>(MainUiState.Idle)
     val uiState: StateFlow<MainUiState> = _uiState
 
     fun loadEpub(uri: Uri) {
+        currentUri = uri
         _uiState.value = MainUiState.Loading
         viewModelScope.launch {
             try {

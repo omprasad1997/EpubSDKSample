@@ -1,41 +1,199 @@
 package com.example.omireadersdk.sdk.overlay
 
+import android.content.Context
+import com.example.omireadersdk.sdk.model.EpubBook
+import com.example.omireadersdk.sdk.model.SmilClip
 import com.example.omireadersdk.sdk.model.SmilDocument
+import com.example.omireadersdk.sdk.parser.EpubExtractor
+import com.example.omireadersdk.sdk.parser.SmilParser
 import com.example.omireadersdk.sdk.renderer.WebViewRenderer
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class MediaOverlayEngine @Inject constructor(
-    private val renderer: WebViewRenderer
+    @ApplicationContext private val context: Context,
+    private val renderer: WebViewRenderer,
+    private val audioPlayer: AudioClipPlayer,
+    private val smilParser: SmilParser
 ) {
-    enum class State { IDLE, PLAYING, PAUSED }
+    enum class State { IDLE, LOADING, PLAYING, PAUSED }
 
-    var state: State = State.IDLE
-        private set
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    fun start(smilDocument: SmilDocument) {
-        // TODO (Week 2): ExoPlayer init + coroutine clip-advance loop
-        state = State.PLAYING
+    private val _state = MutableStateFlow<State>(State.IDLE)
+    val state: StateFlow<State> = _state
+
+    private val _currentFragmentId = MutableStateFlow<String?>(null)
+    val currentFragmentId: StateFlow<String?> = _currentFragmentId
+
+    private var clips = listOf<SmilClip>()
+    private var currentClipIndex = 0
+    private var currentBook: EpubBook? = null
+    private var currentSpineIndex = 0
+    private var cachedAudioFile: File? = null
+    private var activeClass = "-epub-media-overlay-active"
+
+    // ─────────────────────────────────────────────────────────────
+    // Public API
+    // ─────────────────────────────────────────────────────────────
+
+    fun start(
+        book: EpubBook,
+        spineIndex: Int,
+        epubFile: File
+    ) {
+        currentBook = book
+        currentSpineIndex = spineIndex
+        activeClass = book.metadata.activeClass
+        _state.value = State.LOADING
+
+        engineScope.launch {
+            try {
+                // Step 1 — parse SMIL for current spine item
+                val smilDoc = loadSmilDocument(book, spineIndex, epubFile)
+                if (smilDoc == null || smilDoc.clips.isEmpty()) {
+                    _state.value = State.IDLE
+                    return@launch
+                }
+                clips = smilDoc.clips
+                currentClipIndex = 0
+
+                // Step 2 — extract audio to cache (ExoPlayer needs a real file)
+                val audioFile = extractAudioToCache(book, smilDoc, epubFile)
+                if (audioFile == null) {
+                    _state.value = State.IDLE
+                    return@launch
+                }
+                cachedAudioFile = audioFile
+
+                // Step 3 — prepare ExoPlayer then start first clip
+                audioPlayer.prepareAudio(audioFile) {
+                    _state.value = State.PLAYING
+                    playCurrentClip()
+                }
+            } catch (e: Exception) {
+                _state.value = State.IDLE
+            }
+        }
     }
 
     fun pause() {
-        // TODO (Week 2): exoPlayer.pause()
-        state = State.PAUSED
+        if (_state.value != State.PLAYING) return
+        audioPlayer.pause()
+        _state.value = State.PAUSED
     }
 
     fun resume() {
-        // TODO (Week 2): exoPlayer.play()
-        state = State.PLAYING
+        if (_state.value != State.PAUSED) return
+        val clip = clips.getOrNull(currentClipIndex) ?: return
+        _state.value = State.PLAYING
+        audioPlayer.playClip(
+            clipBeginMs = clip.clipBeginMs,
+            clipEndMs = clip.clipEndMs,
+            scope = engineScope,
+            onClipFinished = ::advanceToNextClip
+        )
     }
 
     fun stop() {
-        renderer.clearHighlight()
-        state = State.IDLE
+        audioPlayer.stop()
+        renderer.clearHighlight(activeClass)
+        _currentFragmentId.value = null
+        _state.value = State.IDLE
     }
 
     fun release() {
-        // TODO (Week 2): exoPlayer.release()
-        state = State.IDLE
+        audioPlayer.release()
+        engineScope.cancel()
+        cachedAudioFile?.delete()
+        cachedAudioFile = null
+        _state.value = State.IDLE
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Internal
+    // ─────────────────────────────────────────────────────────────
+
+    private fun playCurrentClip() {
+        val clip = clips.getOrNull(currentClipIndex) ?: run {
+            // All clips done — overlay complete
+            renderer.clearHighlight(activeClass)
+            _currentFragmentId.value = null
+            _state.value = State.IDLE
+            return
+        }
+
+        // Highlight the matching text fragment in WebView
+        renderer.highlight(clip.textFragmentId, activeClass)
+        _currentFragmentId.value = clip.textFragmentId
+
+        // Play the audio clip
+        audioPlayer.playClip(
+            clipBeginMs = clip.clipBeginMs,
+            clipEndMs = clip.clipEndMs,
+            scope = engineScope,
+            onClipFinished = ::advanceToNextClip
+        )
+    }
+
+    private fun advanceToNextClip() {
+        currentClipIndex++
+        playCurrentClip()
+    }
+
+    private suspend fun loadSmilDocument(
+        book: EpubBook,
+        spineIndex: Int,
+        epubFile: File
+    ): SmilDocument? = withContext(Dispatchers.IO) {
+        val spineItem = book.spine.getOrNull(spineIndex) ?: return@withContext null
+        val manifestItem = book.manifest[spineItem.manifestItemId] ?: return@withContext null
+        val overlayId = manifestItem.mediaOverlayId ?: return@withContext null
+        val smilItem = book.manifest[overlayId] ?: return@withContext null
+
+        val extractor = EpubExtractor(epubFile)
+        extractor.use {
+            val stream = it.openEntry(smilItem.href) ?: return@withContext null
+            val smilBase = smilItem.href.substringBeforeLast("/", "")
+                .let { b -> if (b.isEmpty()) "" else "$b/" }
+            smilParser.parse(stream, spineItem.manifestItemId, smilBase)
+        }
+    }
+
+    private suspend fun extractAudioToCache(
+        book: EpubBook,
+        smilDoc: SmilDocument,
+        epubFile: File
+    ): File? = withContext(Dispatchers.IO) {
+        // All clips in vivek_basket use the same audio file
+        val audioZipPath = smilDoc.clips.firstOrNull()?.audioSrc
+            ?: return@withContext null
+
+        val cacheFile = File(
+            context.cacheDir,
+            "omireader_audio_${audioZipPath.substringAfterLast("/")}"
+        )
+
+        // Use cached version if already extracted
+        if (cacheFile.exists() && cacheFile.length() > 0) return@withContext cacheFile
+
+        val extractor = EpubExtractor(epubFile)
+        extractor.use {
+            val stream = it.openEntry(audioZipPath) ?: return@withContext null
+            FileOutputStream(cacheFile).use { out -> stream.copyTo(out) }
+        }
+        cacheFile
     }
 }

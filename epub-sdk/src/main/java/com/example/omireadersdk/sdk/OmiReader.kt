@@ -6,6 +6,7 @@ import com.example.omireadersdk.sdk.model.EpubBook
 import com.example.omireadersdk.sdk.overlay.MediaOverlayEngine
 import com.example.omireadersdk.sdk.parser.EpubParser
 import com.example.omireadersdk.sdk.parser.SmilParser
+import com.example.omireadersdk.sdk.renderer.EpubResourceServer
 import com.example.omireadersdk.sdk.renderer.WebViewRenderer
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -24,7 +25,8 @@ class OmiReader @Inject constructor(
     private val epubParser: EpubParser,
     private val smilParser: SmilParser,
     private val renderer: WebViewRenderer,
-    private val overlayEngine: MediaOverlayEngine
+    private val overlayEngine: MediaOverlayEngine,
+    private val resourceServer: EpubResourceServer
 ) {
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.Main.immediate)
@@ -32,11 +34,14 @@ class OmiReader @Inject constructor(
     private val _readerState = MutableStateFlow<ReaderState>(ReaderState.Idle)
     val readerState: StateFlow<ReaderState> = _readerState
 
+    val overlayState: StateFlow<MediaOverlayEngine.State> = overlayEngine.state
+
     private val _currentHighlightId = MutableStateFlow<String?>(null)
     val currentHighlightId: StateFlow<String?> = _currentHighlightId
 
     private var currentBook: EpubBook? = null
     private var currentSpineIndex = 0
+    private var currentEpubFile: File? = null
 
     fun load(
         epubFile: File,
@@ -47,8 +52,10 @@ class OmiReader @Inject constructor(
         scope.launch {
             try {
                 val book = withContext(Dispatchers.IO) { epubParser.parse(epubFile) }
+                currentEpubFile = epubFile
+                resourceServer.open(epubFile)
                 currentBook = book
-                currentSpineIndex = 0
+                currentSpineIndex = 1
                 renderer.attach(container)
                 renderChapter(currentSpineIndex)
                 _readerState.value = ReaderState.Ready(book)
@@ -71,7 +78,13 @@ class OmiReader @Inject constructor(
     fun previousChapter() = goToChapter(currentSpineIndex - 1)
 
     fun playMediaOverlay() {
-        // TODO (Week 2): load SMIL and start overlay engine
+        val book = currentBook ?: return
+        val file = currentEpubFile ?: return
+        overlayEngine.start(
+            book = book,
+            spineIndex = currentSpineIndex,
+            epubFile = file
+        )
     }
 
     fun pauseMediaOverlay()  = overlayEngine.pause()
@@ -81,6 +94,7 @@ class OmiReader @Inject constructor(
     fun release() {
         overlayEngine.release()
         renderer.release()
+        resourceServer.close()   // ← add this
         scope.cancel()
     }
 
