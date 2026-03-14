@@ -21,8 +21,14 @@ class AudioClipPlayer @Inject constructor(
     private var exoPlayer: ExoPlayer? = null
     private var trackingJob: Job? = null
     private var isAudioReady = false
-    private var isPaused = false
-    private var pausedAtMs = 0L
+    var isPaused = false
+        private set
+
+    companion object {
+        // If next clipBegin differs from current clipEnd by more than this,
+        // we must seek rather than play continuously
+        private const val CONTINUITY_THRESHOLD_MS = 300L
+    }
 
     fun prepareAudio(audioFile: File, onReady: () -> Unit) {
         release()
@@ -40,94 +46,73 @@ class AudioClipPlayer @Inject constructor(
     }
 
     /**
-     * Starts continuous playback from [startMs].
-     * Instead of seeking per clip, we play continuously and fire
-     * [onClipBoundary] whenever we cross a clip boundary.
+     * Plays clips in SMIL order.
      *
-     * @param startMs        Where to start in the audio file
-     * @param clipBoundaries Sorted list of clipEndMs values for each clip
-     * @param onClipBoundary Called with the index of the clip that just finished
-     * @param onAllDone      Called when we pass the last clip's end
+     * For sequential clips (clipBeginN ≈ clipEndN-1): plays continuously, no seek.
+     * For non-sequential clips (big gap or backward jump): seeks to next clipBegin.
+     *
+     * This handles pages like page 3 where the shopping list audio (25-46s)
+     * comes after the narrative audio (46-55s) in SMIL order but is earlier
+     * in the actual audio file.
+     *
+     * @param clips          Full list of SmilClips in SMIL order
+     * @param startClipIndex Which clip to start from
+     * @param onHighlight    Called with clip index when that clip starts playing
+     * @param onAllDone      Called when all clips are done
      */
-    fun startContinuous(
-        startMs: Long,
-        clipBoundaries: List<Long>,
+    fun playClipsInOrder(
+        clips: List<com.example.omireadersdk.sdk.model.SmilClip>,
+        startClipIndex: Int = 0,
         scope: CoroutineScope,
-        onClipBoundary: (clipIndex: Int) -> Unit,
+        onHighlight: (clipIndex: Int) -> Unit,
         onAllDone: () -> Unit
     ) {
         val player = exoPlayer ?: return
         trackingJob?.cancel()
         isPaused = false
 
-        val boundaries = clipBoundaries.sorted()
-        var nextBoundaryIndex = 0
+        trackingJob = scope.launch(Dispatchers.Main) {
+            var clipIndex = startClipIndex
 
-        // Listen for seek completion before starting tracking
-        player.addListener(object : Player.Listener {
-            override fun onPositionDiscontinuity(
-                oldPosition: Player.PositionInfo,
-                newPosition: Player.PositionInfo,
-                reason: Int
-            ) {
-                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
-                    // Seek completed — remove this listener and start tracking
-                    player.removeListener(this)
-                    startTracking(player, startMs, boundaries, scope, onClipBoundary, onAllDone)
-                        .also { trackingJob = it }
+            // Seek to first clip
+            seekAndWait(player, clips[clipIndex].clipBeginMs)
+
+            while (clipIndex < clips.size) {
+                if (isPaused) {
+                    delay(50)
+                    continue
                 }
-            }
-        })
 
-        // Seek and play
-        player.seekTo(startMs)
-        player.playWhenReady = true
-    }
+                val clip = clips[clipIndex]
 
-    private fun startTracking(
-        player: ExoPlayer,
-        startMs: Long,
-        boundaries: List<Long>,
-        scope: CoroutineScope,
-        onClipBoundary: (clipIndex: Int) -> Unit,
-        onAllDone: () -> Unit
-    ): Job {
-        return scope.launch(Dispatchers.Main) {
+                // Highlight current word
+                onHighlight(clipIndex)
 
-            // Wait one frame for position to stabilize after seek
-            delay(32)
+                // Ensure audio is playing
+                if (!player.isPlaying) player.play()
 
-            // Use ACTUAL current position — not startMs
-            // By the time tracking starts, player may have already
-            // moved past several clips
-            var nextBoundaryIndex = 0
-            val actualPos = player.currentPosition
+                // Wait until we reach clipEnd
+                while (true) {
+                    delay(16)
+                    if (isPaused) break
+                    val pos = player.currentPosition
+                    if (pos >= clip.clipEndMs) break
+                }
 
-            // Skip all boundaries already passed based on real position
-            while (nextBoundaryIndex < boundaries.size &&
-                boundaries[nextBoundaryIndex] <= actualPos) {
-                nextBoundaryIndex++
-            }
-
-            // Fire highlight for the clip we're currently inside
-            if (nextBoundaryIndex > 0) {
-                onClipBoundary(nextBoundaryIndex - 1)
-            }
-
-            // Now track forward from actual position
-            while (nextBoundaryIndex < boundaries.size) {
-                delay(16)
                 if (isPaused) continue
 
-                val pos = player.currentPosition
+                clipIndex++
 
-                // Safety: ignore stale position during buffering
-                if (pos < startMs - 200) continue
+                if (clipIndex >= clips.size) break
 
-                if (pos >= boundaries[nextBoundaryIndex]) {
-                    onClipBoundary(nextBoundaryIndex)
-                    nextBoundaryIndex++
+                val nextClip = clips[clipIndex]
+                val gap = nextClip.clipBeginMs - clip.clipEndMs
+
+                // If next clip is not sequential — seek to it
+                if (gap > CONTINUITY_THRESHOLD_MS || gap < -CONTINUITY_THRESHOLD_MS) {
+                    seekAndWait(player, nextClip.clipBeginMs)
                 }
+                // If sequential — just keep playing, no seek needed
             }
 
             player.pause()
@@ -137,7 +122,6 @@ class AudioClipPlayer @Inject constructor(
 
     fun pause() {
         isPaused = true
-        pausedAtMs = exoPlayer?.currentPosition ?: 0L
         exoPlayer?.pause()
     }
 
@@ -163,4 +147,37 @@ class AudioClipPlayer @Inject constructor(
     }
 
     val isReady: Boolean get() = isAudioReady
+
+    /**
+     * Seeks ExoPlayer and waits for the seek to stabilize.
+     * Uses onPositionDiscontinuity callback for accuracy.
+     */
+    private suspend fun seekAndWait(player: ExoPlayer, positionMs: Long) {
+        var seekDone = false
+        val listener = object : Player.Listener {
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) {
+                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                    seekDone = true
+                }
+            }
+        }
+        player.addListener(listener)
+        player.seekTo(positionMs)
+        player.playWhenReady = true
+
+        // Wait for seek to complete, max 500ms
+        var waited = 0
+        while (!seekDone && waited < 500) {
+            delay(16)
+            waited += 16
+        }
+        player.removeListener(listener)
+
+        // Extra stabilization frame
+        delay(32)
+    }
 }

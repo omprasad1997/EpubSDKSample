@@ -60,7 +60,10 @@ class OmiReader @Inject constructor(
                 }
                 currentBook = book
                 currentSpineIndex = 1
-                renderer.attach(container)
+                renderer.attach(container, onPageReady = {
+                    // Page has fully loaded — now safe to highlight first word
+                    overlayEngine.highlightFirstWord(book, currentSpineIndex, currentEpubFile!!)
+                })
                 renderChapter(currentSpineIndex)
                 _readerState.value = ReaderState.Ready(book)
                 onLoaded(book)
@@ -97,9 +100,14 @@ class OmiReader @Inject constructor(
 
     fun goToChapter(index: Int) {
         val book = currentBook ?: return
+        val file = currentEpubFile ?: return
         if (index !in book.spine.indices) return
         overlayEngine.stop()
         currentSpineIndex = index
+        // Register highlight callback BEFORE loading the page
+        renderer.onNextPageReady {
+            overlayEngine.highlightFirstWord(book, index, file)
+        }
         renderChapter(index)
     }
 

@@ -78,24 +78,15 @@ class MediaOverlayEngine @Inject constructor(
                 audioPlayer.prepareAudio(audioFile) {
                     _state.value = State.PLAYING
 
-                    // Highlight first word immediately
-                    highlightClip(0)
-
-                    // Play continuously — no seeking between words
-                    val startMs = clips.first().clipBeginMs
-                    val boundaries = clips.map { it.clipEndMs }
-
-                    audioPlayer.startContinuous(
-                        startMs = startMs,
-                        clipBoundaries = boundaries,
+                    audioPlayer.playClipsInOrder(
+                        clips = clips,
+                        startClipIndex = 0,
                         scope = engineScope,
-                        onClipBoundary = { finishedIndex ->
-                            // Highlight next word
-                            val nextIndex = finishedIndex + 1
-                            if (nextIndex < clips.size) {
-                                highlightClip(nextIndex)
-                                currentClipIndex = nextIndex
-                            }
+                        onHighlight = { index ->
+                            currentClipIndex = index
+                            val clip = clips.getOrNull(index) ?: return@playClipsInOrder
+                            _currentFragmentId.value = clip.textFragmentId
+                            renderer.highlight(clip.textFragmentId, activeClass)
                         },
                         onAllDone = {
                             renderer.clearHighlight(activeClass)
@@ -190,5 +181,16 @@ class MediaOverlayEngine @Inject constructor(
             FileOutputStream(cacheFile).use { out -> stream.copyTo(out) }
         }
         cacheFile
+    }
+
+    fun highlightFirstWord(book: EpubBook, spineIndex: Int, epubFile: File) {
+        engineScope.launch {
+            try {
+                val smilDoc = loadSmilDocument(book, spineIndex, epubFile) ?: return@launch
+                val firstClip = smilDoc.clips.firstOrNull() ?: return@launch
+                renderer.highlight(firstClip.textFragmentId, book.metadata.activeClass)
+                _currentFragmentId.value = firstClip.textFragmentId
+            } catch (_: Exception) { }
+        }
     }
 }

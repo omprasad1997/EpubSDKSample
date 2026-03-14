@@ -18,6 +18,11 @@ class WebViewRenderer @Inject constructor(
 ) {
     private var webView: WebView? = null
     private var onPageReady: (() -> Unit)? = null
+    private var onNextPageReady: (() -> Unit)? = null
+
+    fun onNextPageReady(callback: () -> Unit) {
+        onNextPageReady = callback
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     fun attach(container: ViewGroup, onPageReady: (() -> Unit)? = null) {
@@ -109,6 +114,9 @@ class WebViewRenderer @Inject constructor(
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
             onPageReady?.invoke()
+            // Fire one-shot callback then clear it
+            onNextPageReady?.invoke()
+            onNextPageReady = null
         }
     }
 }
