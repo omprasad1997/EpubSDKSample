@@ -54,6 +54,10 @@ class OmiReader @Inject constructor(
                 val book = withContext(Dispatchers.IO) { epubParser.parse(epubFile) }
                 currentEpubFile = epubFile
                 resourceServer.open(epubFile)
+                // Warm up audio cache in background
+                launch(Dispatchers.IO) {
+                    preloadAudio(book, epubFile)
+                }
                 currentBook = book
                 currentSpineIndex = 1
                 renderer.attach(container)
@@ -64,6 +68,31 @@ class OmiReader @Inject constructor(
                 _readerState.value = ReaderState.Error(e.message ?: "Failed to load EPUB")
             }
         }
+    }
+
+    private suspend fun preloadAudio(book: EpubBook, epubFile: File) {
+        // Find first SMIL with audio and extract it to cache
+        val firstSmilItem = book.manifest.values
+            .firstOrNull { it.isSmil } ?: return
+
+        try {
+            val extractor = com.example.omireadersdk.sdk.parser.EpubExtractor(epubFile)
+            extractor.use {
+                val stream = it.openEntry(firstSmilItem.href) ?: return
+                val smilBase = firstSmilItem.href.substringBeforeLast("/", "")
+                    .let { b -> if (b.isEmpty()) "" else "$b/" }
+                val smilDoc = smilParser.parse(stream, firstSmilItem.id, smilBase)
+                val audioPath = smilDoc.clips.firstOrNull()?.audioSrc ?: return
+                val cacheFile = java.io.File(
+                    context.cacheDir,
+                    "omireader_audio_${audioPath.substringAfterLast("/")}"
+                )
+                if (!cacheFile.exists()) {
+                    val audioStream = it.openEntry(audioPath) ?: return
+                    java.io.FileOutputStream(cacheFile).use { out -> audioStream.copyTo(out) }
+                }
+            }
+        } catch (_: Exception) { }
     }
 
     fun goToChapter(index: Int) {

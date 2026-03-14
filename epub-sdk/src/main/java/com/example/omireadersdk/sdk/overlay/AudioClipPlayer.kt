@@ -14,39 +14,19 @@ import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/**
- * Wraps ExoPlayer to play precise audio clip ranges from the EPUB audio file.
- *
- * Each [SmilClip] has a clipBeginMs and clipEndMs — we seek ExoPlayer
- * to clipBeginMs and poll currentPosition every 50ms until clipEndMs
- * is reached, then call [onClipFinished] to advance to the next clip.
- */
 @Singleton
 class AudioClipPlayer @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
     private var exoPlayer: ExoPlayer? = null
-    private var clipEndMs: Long = 0L
-    private var pollJob: Job? = null
-    private var onClipFinished: (() -> Unit)? = null
+    private var trackingJob: Job? = null
     private var isAudioReady = false
+    private var isPaused = false
+    private var pausedAtMs = 0L
 
-    // ─────────────────────────────────────────────────────────────
-    // Setup
-    // ─────────────────────────────────────────────────────────────
-
-    /**
-     * Prepares the ExoPlayer with the audio file.
-     * Must be called once before [playClip].
-     * For vivek_basket.epub this is "OEBPS/sample_audio.mp4"
-     * which we extract to a temp cache file first.
-     */
     fun prepareAudio(audioFile: File, onReady: () -> Unit) {
         release()
-        val player = ExoPlayer.Builder(context).build().also {
-            exoPlayer = it
-        }
-
+        val player = ExoPlayer.Builder(context).build().also { exoPlayer = it }
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 if (state == Player.STATE_READY && !isAudioReady) {
@@ -55,84 +35,131 @@ class AudioClipPlayer @Inject constructor(
                 }
             }
         })
-
-        val mediaItem = MediaItem.fromUri(
-            android.net.Uri.fromFile(audioFile)
-        )
-        player.setMediaItem(mediaItem)
+        player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(audioFile)))
         player.prepare()
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Playback
-    // ─────────────────────────────────────────────────────────────
-
     /**
-     * Seeks to [clipBeginMs] and plays until [clipEndMs].
-     * Calls [onClipFinished] when the clip ends so the engine
-     * can advance to the next [SmilClip].
+     * Starts continuous playback from [startMs].
+     * Instead of seeking per clip, we play continuously and fire
+     * [onClipBoundary] whenever we cross a clip boundary.
+     *
+     * @param startMs        Where to start in the audio file
+     * @param clipBoundaries Sorted list of clipEndMs values for each clip
+     * @param onClipBoundary Called with the index of the clip that just finished
+     * @param onAllDone      Called when we pass the last clip's end
      */
-    fun playClip(
-        clipBeginMs: Long,
-        clipEndMs: Long,
+    fun startContinuous(
+        startMs: Long,
+        clipBoundaries: List<Long>,
         scope: CoroutineScope,
-        onClipFinished: () -> Unit
+        onClipBoundary: (clipIndex: Int) -> Unit,
+        onAllDone: () -> Unit
     ) {
         val player = exoPlayer ?: return
-        this.clipEndMs = clipEndMs
-        this.onClipFinished = onClipFinished
+        trackingJob?.cancel()
+        isPaused = false
 
-        // Cancel any previous poll
-        pollJob?.cancel()
+        val boundaries = clipBoundaries.sorted()
+        var nextBoundaryIndex = 0
 
-        // Seek and play
-        player.seekTo(clipBeginMs)
-        player.play()
-
-        // Poll every 50ms — fire callback when we reach clipEndMs
-        pollJob = scope.launch(Dispatchers.Main) {
-            while (true) {
-                delay(50)
-                val pos = player.currentPosition
-                if (pos >= clipEndMs) {
-                    player.pause()
-                    pollJob = null
-                    onClipFinished()
-                    break
+        // Listen for seek completion before starting tracking
+        player.addListener(object : Player.Listener {
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) {
+                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                    // Seek completed — remove this listener and start tracking
+                    player.removeListener(this)
+                    startTracking(player, startMs, boundaries, scope, onClipBoundary, onAllDone)
+                        .also { trackingJob = it }
                 }
             }
+        })
+
+        // Seek and play
+        player.seekTo(startMs)
+        player.playWhenReady = true
+    }
+
+    private fun startTracking(
+        player: ExoPlayer,
+        startMs: Long,
+        boundaries: List<Long>,
+        scope: CoroutineScope,
+        onClipBoundary: (clipIndex: Int) -> Unit,
+        onAllDone: () -> Unit
+    ): Job {
+        return scope.launch(Dispatchers.Main) {
+
+            // Wait one frame for position to stabilize after seek
+            delay(32)
+
+            // Use ACTUAL current position — not startMs
+            // By the time tracking starts, player may have already
+            // moved past several clips
+            var nextBoundaryIndex = 0
+            val actualPos = player.currentPosition
+
+            // Skip all boundaries already passed based on real position
+            while (nextBoundaryIndex < boundaries.size &&
+                boundaries[nextBoundaryIndex] <= actualPos) {
+                nextBoundaryIndex++
+            }
+
+            // Fire highlight for the clip we're currently inside
+            if (nextBoundaryIndex > 0) {
+                onClipBoundary(nextBoundaryIndex - 1)
+            }
+
+            // Now track forward from actual position
+            while (nextBoundaryIndex < boundaries.size) {
+                delay(16)
+                if (isPaused) continue
+
+                val pos = player.currentPosition
+
+                // Safety: ignore stale position during buffering
+                if (pos < startMs - 200) continue
+
+                if (pos >= boundaries[nextBoundaryIndex]) {
+                    onClipBoundary(nextBoundaryIndex)
+                    nextBoundaryIndex++
+                }
+            }
+
+            player.pause()
+            onAllDone()
         }
     }
 
     fun pause() {
-        pollJob?.cancel()
-        pollJob = null
+        isPaused = true
+        pausedAtMs = exoPlayer?.currentPosition ?: 0L
         exoPlayer?.pause()
     }
 
-    fun resume(
-        clipBeginMs: Long,
-        clipEndMs: Long,
-        scope: CoroutineScope,
-        onClipFinished: () -> Unit
-    ) {
-        // Resume means replay current clip from its beginning
-        playClip(clipBeginMs, clipEndMs, scope, onClipFinished)
+    fun resume() {
+        isPaused = false
+        exoPlayer?.play()
     }
 
     fun stop() {
-        pollJob?.cancel()
-        pollJob = null
+        trackingJob?.cancel()
+        trackingJob = null
+        isPaused = false
         exoPlayer?.stop()
-        exoPlayer?.seekTo(0)
     }
 
     fun release() {
-        pollJob?.cancel()
-        pollJob = null
+        trackingJob?.cancel()
+        trackingJob = null
         exoPlayer?.release()
         exoPlayer = null
         isAudioReady = false
+        isPaused = false
     }
 
     val isReady: Boolean get() = isAudioReady

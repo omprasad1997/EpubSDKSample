@@ -61,7 +61,6 @@ class MediaOverlayEngine @Inject constructor(
 
         engineScope.launch {
             try {
-                // Step 1 — parse SMIL for current spine item
                 val smilDoc = loadSmilDocument(book, spineIndex, epubFile)
                 if (smilDoc == null || smilDoc.clips.isEmpty()) {
                     _state.value = State.IDLE
@@ -70,23 +69,52 @@ class MediaOverlayEngine @Inject constructor(
                 clips = smilDoc.clips
                 currentClipIndex = 0
 
-                // Step 2 — extract audio to cache (ExoPlayer needs a real file)
                 val audioFile = extractAudioToCache(book, smilDoc, epubFile)
                 if (audioFile == null) {
                     _state.value = State.IDLE
                     return@launch
                 }
-                cachedAudioFile = audioFile
 
-                // Step 3 — prepare ExoPlayer then start first clip
                 audioPlayer.prepareAudio(audioFile) {
                     _state.value = State.PLAYING
-                    playCurrentClip()
+
+                    // Highlight first word immediately
+                    highlightClip(0)
+
+                    // Play continuously — no seeking between words
+                    val startMs = clips.first().clipBeginMs
+                    val boundaries = clips.map { it.clipEndMs }
+
+                    audioPlayer.startContinuous(
+                        startMs = startMs,
+                        clipBoundaries = boundaries,
+                        scope = engineScope,
+                        onClipBoundary = { finishedIndex ->
+                            // Highlight next word
+                            val nextIndex = finishedIndex + 1
+                            if (nextIndex < clips.size) {
+                                highlightClip(nextIndex)
+                                currentClipIndex = nextIndex
+                            }
+                        },
+                        onAllDone = {
+                            renderer.clearHighlight(activeClass)
+                            _currentFragmentId.value = null
+                            _state.value = State.IDLE
+                        }
+                    )
                 }
             } catch (e: Exception) {
                 _state.value = State.IDLE
             }
         }
+    }
+
+    private fun highlightClip(index: Int) {
+        val clip = clips.getOrNull(index) ?: return
+        currentClipIndex = index
+        _currentFragmentId.value = clip.textFragmentId
+        renderer.highlight(clip.textFragmentId, activeClass)
     }
 
     fun pause() {
@@ -97,14 +125,8 @@ class MediaOverlayEngine @Inject constructor(
 
     fun resume() {
         if (_state.value != State.PAUSED) return
-        val clip = clips.getOrNull(currentClipIndex) ?: return
         _state.value = State.PLAYING
-        audioPlayer.playClip(
-            clipBeginMs = clip.clipBeginMs,
-            clipEndMs = clip.clipEndMs,
-            scope = engineScope,
-            onClipFinished = ::advanceToNextClip
-        )
+        audioPlayer.resume()
     }
 
     fun stop() {
@@ -125,33 +147,6 @@ class MediaOverlayEngine @Inject constructor(
     // ─────────────────────────────────────────────────────────────
     // Internal
     // ─────────────────────────────────────────────────────────────
-
-    private fun playCurrentClip() {
-        val clip = clips.getOrNull(currentClipIndex) ?: run {
-            // All clips done — overlay complete
-            renderer.clearHighlight(activeClass)
-            _currentFragmentId.value = null
-            _state.value = State.IDLE
-            return
-        }
-
-        // Highlight the matching text fragment in WebView
-        renderer.highlight(clip.textFragmentId, activeClass)
-        _currentFragmentId.value = clip.textFragmentId
-
-        // Play the audio clip
-        audioPlayer.playClip(
-            clipBeginMs = clip.clipBeginMs,
-            clipEndMs = clip.clipEndMs,
-            scope = engineScope,
-            onClipFinished = ::advanceToNextClip
-        )
-    }
-
-    private fun advanceToNextClip() {
-        currentClipIndex++
-        playCurrentClip()
-    }
 
     private suspend fun loadSmilDocument(
         book: EpubBook,
