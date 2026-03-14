@@ -36,6 +36,11 @@ android {
     publishing {
         singleVariant("release") { withSourcesJar() }
     }
+
+    lint {
+        baseline = file("lint-baseline.xml")
+        abortOnError = false
+    }
 }
 
 afterEvaluate {

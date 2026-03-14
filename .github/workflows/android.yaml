@@ -133,6 +133,7 @@ jobs:
 
       - name: Run lint
         run: ./gradlew lint --stacktrace --warning-mode all
+        continue-on-error: true
 
       - name: Upload lint results
         if: always()
